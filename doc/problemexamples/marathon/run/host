@@ -1,0 +1,213 @@
+#!/bin/bash
+# ////////////////////////////////////////////////////////////////////////////////
+# //BOCA Online Contest Administrator
+# //    Copyright (C) 2003-2012 by BOCA System (bocasystem@gmail.com)
+# //
+# //    This program is free software: you can redistribute it and/or modify
+# //    it under the terms of the GNU General Public License as published by
+# //    the Free Software Foundation, either version 3 of the License, or
+# //    (at your option) any later version.
+# //
+# //    This program is distributed in the hope that it will be useful,
+# //    but WITHOUT ANY WARRANTY; without even the implied warranty of
+# //    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# //    GNU General Public License for more details.
+# //    You should have received a copy of the GNU General Public License
+# //    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# ////////////////////////////////////////////////////////////////////////////////
+#Last modified: 22/aug/2012 by cassio@ime.usp.br
+#
+# parameters are:
+# $1 exe_file
+# $2 input_file
+# $3 timelimit (limit to run all the repetitions, by default only one repetition)
+# $4 number_of_repetitions_to_run (optional, can be used for better tuning the timelimit)
+# $5 maximum allowed memory (in MBytes)
+# $6 maximum allowed output size (in KBytes)
+#
+# the output of the submission should be directed to the standard output
+#
+# the return code show what happened (according to safeexec):
+# 0 ok
+# 1 compile error
+# 2 runtime error
+# 3 timelimit exceeded
+# 4 internal error
+# 5 parameter error
+# 6 internal error
+# 7 memory limit exceeded
+# 8 security threat
+# 9 runtime error
+# other_codes are unknown to boca: in this case BOCA will present the
+#                                  last line of standard output to the judge
+
+umask 0022
+id -u bocajail >/dev/null 2>/dev/null
+if [ $? == 0 ]; then
+	bocau=`id -u bocajail`
+	bocag=`id -g bocajail`
+	chown bocajail.nogroup .
+else
+	bocau=`id | cut -d'=' -f2 | cut -d'(' -f1`
+	bocag=`id | cut -d'=' -f3 | cut -d'(' -f1`
+	#chown nobody.nogroup .
+fi
+if [ "$bocau" == "" -o "$bocag" == "" ]; then
+	echo "error finding user to run script"
+	exit 43
+fi
+
+echo "Copying submition files to 'tmp'"
+cp ../src/* .
+cp ../src/.* .
+
+# this script makes use of safeexec to execute the code with less privilegies
+# make sure that directories below are correct.
+sf=`which safeexec`
+[ -x "$sf" ] || sf=/usr/bin/safeexec
+
+if [ "$1" == "" -o "$2" == "" -o "$3" == "" ]; then
+    echo "parameter problem"
+    exit 43
+fi
+if [ ! -x "$1" ]; then
+    echo "$1 not found (or is not in the current dir) or it's not executable"
+    exit 44
+fi
+if [ ! -r "$2" ]; then
+    echo "$2 not found (or is not in the current dir) or it's not readable"
+    exit 45
+fi
+if [ ! -x $sf ]; then
+    echo "$sf not found or it's not executable"
+    exit 46
+fi
+
+time=$3
+printf -v int_time %.0f "$time"
+time=$((int_time + 2))
+if [ "$time" -gt "0" ]; then
+  ttime=$((ttime + 30))
+else
+  time=1
+  ttime=30
+fi
+
+nruns=1
+if [ "$4" != "" ]; then
+  if [ "$4" -gt "0" ]; then
+    nruns=$4
+  fi
+fi
+maxm=512000
+if [ "$5" != "" ]; then
+  if [ "$5" -gt "0" ]; then
+    maxm=${5}000
+  fi
+fi
+maxf=1024
+if [ "$6" != "" ]; then
+  if [ "$6" -gt "0" ]; then
+    maxf=${6}
+  fi
+fi
+
+cp "$2" stdin0 2>/dev/null
+cp "$1" run.exe 2>/dev/null
+
+file run.exe | grep -iq "statically linked"
+if [ "$?" != "0" ]; then
+  echo "Warning: $1 is not statically linked"
+#  exit 47
+fi
+
+relf=`which readelf`
+[ -x "$relf" ] || relf=/usr/bin/readelf
+if [ ! -x "$relf" ]; then
+  echo "$relf not found or it's not executable"
+  exit 47
+fi
+
+for file in ./*; do
+  if [ -x $file ]; then
+    mchn=`$relf -h $file | grep Machine | awk '{print $3}'`
+    if [ "$mchn" == "K1OM" ] || [ "$mchn" == "0xb5" ]; then
+      echo "Runtime error: not a x86 binary compatible." >&2
+      exit 2
+    fi
+  fi
+done
+
+cdir=`pwd`
+echo "Current directory is $cdir -- chrooting on it"
+echo "Running $sf to check execution"
+echo "$sf -p -a -F11 -f$maxf -r1 -n1 -R$cdir -C. -U$bocau -G$bocag -ostdout0 -estderr0 -d$maxm -m$maxm -t$time -T$ttime -istdin0 ./run.exe ----> NOT WORKING!!!! WHY!?!?!"
+
+cat <<EOF > runit.sh
+#!/bin/bash
+#http://stackoverflow.com/questions/687948/timeout-a-command-in-bash-without-unnecessary-delay
+(
+    ((t = $time))
+
+    while ((t > 0)); do
+        sleep 1
+        kill -0 \$\$ || exit 0
+        ((t -= 1))
+    done
+
+    # Be nice, post SIGTERM first.
+    # The 'exit 2' below will be executed if any preceeding command fails.
+    kill -s SIGTERM \$\$ && kill -0 \$\$ || exit 2
+    sleep 1
+    kill -s SIGKILL \$\$
+    exit 3
+) 2>&1 &
+
+exec ./run.exe <$cdir/stdin0 1>$cdir/stdout0 2>$cdir/stderr0
+exit \$?
+EOF
+chmod 755 runit.sh
+
+{ ./runit.sh ; } 2>&1
+ret=$?
+
+if [ $ret -gt 128 ]; then
+  echo "Output unavailable" 1>&2
+  exit 3
+elif [ $ret -gt 10 ]; then
+  ret=0
+elif [ "$ret" -ne "0" ]; then
+  echo "Output unavailable" 1>&2
+  if [ -f stdout0 ]; then
+    tail -n 1 stdout0
+  fi
+  exit 2
+fi
+
+cp stdout0 ../
+
+stderr=`head -n 1 stderr0`
+if [ "$stderr" != "" ]; then
+  echo $stderr
+  exit 2
+fi
+cp stderr0 ../
+
+echo "Collecting time..."
+for run in $(seq 1 $nruns); do
+  { time -p ./run.exe < stdin0 &> /dev/null ; } 2>&1 | grep real | xargs | cut -d " " -f 2 &>> times.txt
+done
+awk -f - times.txt <<-EOF >> times.txt
+{
+	for(i=1; i<=NF; i++) {
+		sum   +=  \$i;
+	}
+}
+END {
+	printf "%.6f\n", sum/NR;
+}
+EOF
+echo "Running times:"
+cat times.txt
+
+exit $ret
